@@ -20,8 +20,8 @@ var (
 )
 
 const (
-	datagramChannelBufferSize = 10
-	datagramReadBufferSize    = 64 * 1024
+	defaultDatagramChannelBufferSize = 10
+	defaultDatagramReadBufferSize    = 64 * 1024
 )
 
 // A function type which gets the TLS peer name from the connection. Can return
@@ -35,6 +35,7 @@ type Server struct {
 	doneTcp                 chan bool
 	datagramChannelSize     int
 	datagramChannel         chan DatagramMessage
+	datagramReadBufferSize  int
 	format                  format.Format
 	handler                 Handler
 	lastError               error
@@ -43,29 +44,31 @@ type Server struct {
 	datagramPool            sync.Pool
 }
 
-//NewServer returns a new Server
+// NewServer returns a new Server
 func NewServer() *Server {
-	return &Server{tlsPeerNameFunc: defaultTlsPeerName, datagramPool: sync.Pool{
-		New: func() interface{} {
-			return make([]byte, 65536)
+	return &Server{
+		tlsPeerNameFunc: defaultTlsPeerName, datagramPool: sync.Pool{
+			New: func() interface{} {
+				return make([]byte, 65536)
+			},
 		},
-	},
 
-		datagramChannelSize: datagramChannelBufferSize,
+		datagramChannelSize:    defaultDatagramChannelBufferSize,
+		datagramReadBufferSize: defaultDatagramReadBufferSize,
 	}
 }
 
-//Sets the syslog format (RFC3164 or RFC5424 or RFC6587)
+// Sets the syslog format (RFC3164 or RFC5424 or RFC6587)
 func (s *Server) SetFormat(f format.Format) {
 	s.format = f
 }
 
-//Sets the handler, this handler with receive every syslog entry
+// Sets the handler, this handler with receive every syslog entry
 func (s *Server) SetHandler(handler Handler) {
 	s.handler = handler
 }
 
-//Sets the connection timeout for TCP connections, in milliseconds
+// Sets the connection timeout for TCP connections, in milliseconds
 func (s *Server) SetTimeout(millseconds int64) {
 	s.readTimeoutMilliseconds = millseconds
 }
@@ -79,6 +82,10 @@ func (s *Server) SetDatagramChannelSize(size int) {
 	s.datagramChannelSize = size
 }
 
+func (s *Server) SetDatagramReadBufferSize(size int) {
+	s.datagramReadBufferSize = size
+}
+
 // Default TLS peer name function - returns the CN of the certificate
 func defaultTlsPeerName(tlsConn *tls.Conn) (tlsPeer string, ok bool) {
 	state := tlsConn.ConnectionState()
@@ -89,7 +96,7 @@ func defaultTlsPeerName(tlsConn *tls.Conn) (tlsPeer string, ok bool) {
 	return cn, true
 }
 
-//Configure the server for listen on an UDP addr
+// Configure the server for listen on an UDP addr
 func (s *Server) ListenUDP(addr string) error {
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
@@ -100,13 +107,13 @@ func (s *Server) ListenUDP(addr string) error {
 	if err != nil {
 		return err
 	}
-	connection.SetReadBuffer(datagramReadBufferSize)
+	connection.SetReadBuffer(s.datagramReadBufferSize)
 
 	s.connections = append(s.connections, connection)
 	return nil
 }
 
-//Configure the server for listen on an unix socket
+// Configure the server for listen on an unix socket
 func (s *Server) ListenUnixgram(addr string) error {
 	unixAddr, err := net.ResolveUnixAddr("unixgram", addr)
 	if err != nil {
@@ -117,13 +124,13 @@ func (s *Server) ListenUnixgram(addr string) error {
 	if err != nil {
 		return err
 	}
-	connection.SetReadBuffer(datagramReadBufferSize)
+	connection.SetReadBuffer(s.datagramReadBufferSize)
 
 	s.connections = append(s.connections, connection)
 	return nil
 }
 
-//Configure the server for listen on a TCP addr
+// Configure the server for listen on a TCP addr
 func (s *Server) ListenTCP(addr string) error {
 	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
@@ -140,7 +147,7 @@ func (s *Server) ListenTCP(addr string) error {
 	return nil
 }
 
-//Configure the server for listen on a TCP addr for TLS
+// Configure the server for listen on a TCP addr for TLS
 func (s *Server) ListenTCPTLS(addr string, config *tls.Config) error {
 	listener, err := tls.Listen("tcp", addr, config)
 	if err != nil {
@@ -152,7 +159,7 @@ func (s *Server) ListenTCPTLS(addr string, config *tls.Config) error {
 	return nil
 }
 
-//Starts the server, all the go routines goes to live
+// Starts the server, all the go routines goes to live
 func (s *Server) Boot() error {
 	if s.format == nil {
 		return errors.New("please set a valid format")
@@ -228,8 +235,7 @@ func (s *Server) goScanConnection(connection net.Conn) {
 		}
 	}
 
-	var scanCloser *ScanCloser
-	scanCloser = &ScanCloser{scanner, connection}
+	scanCloser := &ScanCloser{scanner, connection}
 
 	s.wait.Add(1)
 	go s.scan(scanCloser, client, tlsPeer)
@@ -278,12 +284,12 @@ func (s *Server) parser(line []byte, client string, tlsPeer string) {
 	s.handler.Handle(logParts, int64(len(line)), err)
 }
 
-//Returns the last error
+// Returns the last error
 func (s *Server) GetLastError() error {
 	return s.lastError
 }
 
-//Kill the server
+// Kill the server
 func (s *Server) Kill() error {
 	for _, connection := range s.connections {
 		err := connection.Close()
@@ -308,7 +314,7 @@ func (s *Server) Kill() error {
 	return nil
 }
 
-//Waits until the server stops
+// Waits until the server stops
 func (s *Server) Wait() {
 	s.wait.Wait()
 }
@@ -366,21 +372,15 @@ func (s *Server) goParseDatagrams() {
 	s.wait.Add(1)
 	go func() {
 		defer s.wait.Done()
-		for {
-			select {
-			case msg, ok := (<-s.datagramChannel):
-				if !ok {
-					return
+		for msg := range s.datagramChannel {
+			if sf := s.format.GetSplitFunc(); sf != nil {
+				if _, token, err := sf(msg.message, true); err == nil {
+					s.parser(token, msg.client, "")
 				}
-				if sf := s.format.GetSplitFunc(); sf != nil {
-					if _, token, err := sf(msg.message, true); err == nil {
-						s.parser(token, msg.client, "")
-					}
-				} else {
-					s.parser(msg.message, msg.client, "")
-				}
-				s.datagramPool.Put(msg.message[:cap(msg.message)])
+			} else {
+				s.parser(msg.message, msg.client, "")
 			}
+			s.datagramPool.Put(msg.message[:cap(msg.message)])
 		}
 	}()
 }
